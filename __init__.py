@@ -2,12 +2,15 @@
 Hermes Star Office Reporter Plugin
 
 Auto-reports Hermes tool activity to a Star Office UI dashboard.
+
+Hook registration follows Ponytail's pattern: load() receives ctx and calls
+ctx.register_hook() to dynamically register hooks.
 """
 
 import json
 import logging
 import os
-import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -100,45 +103,75 @@ class StarOfficeReporter:
 
     def _push_event(self, event_type: str, payload: Dict[str, Any]):
         """Push event to dashboard (non-blocking)."""
-        try:
-            event = {
-                "version": 1,
-                "agent": self.agent_name,
-                "event_type": event_type,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "payload": payload,
-            }
+        def _do_push():
+            try:
+                event = {
+                    "version": 1,
+                    "agent": self.agent_name,
+                    "event_type": event_type,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "payload": payload,
+                }
 
-            url = f"{self.dashboard_url.rstrip('/')}/events"
-            resp = requests.post(
-                url, json=event, timeout=self.timeout, headers={"Content-Type": "application/json"}
-            )
-            resp.raise_for_status()
-            logger.debug(f"Pushed {event_type} to {url}")
+                url = f"{self.dashboard_url.rstrip('/')}/events"
+                resp = requests.post(
+                    url, json=event, timeout=self.timeout, headers={"Content-Type": "application/json"}
+                )
+                resp.raise_for_status()
+                logger.debug(f"Pushed {event_type} to {url}")
 
-        except requests.RequestException as e:
-            logger.warning(f"Failed to push {event_type} to dashboard: {e}")
-            if self.retry:
-                # Optional: implement retry logic here
-                pass
-        except Exception as e:
-            logger.error(f"Unexpected error pushing {event_type}: {e}")
+            except requests.RequestException as e:
+                logger.warning(f"Failed to push {event_type} to dashboard: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error pushing {event_type}: {e}")
+
+        # Push in background thread to not block Hermes
+        threading.Thread(target=_do_push, daemon=True).start()
 
 
-# Plugin entry point
-def load(hermes_config: Dict[str, Any], profile_name: Optional[str] = None) -> StarOfficeReporter:
+# Singleton reporter instance (set by load())
+_reporter: Optional[StarOfficeReporter] = None
+
+
+def _on_tool_complete(tool_name: str = "", args: Any = None, result: Any = None, success: bool = True, **kwargs):
+    """Hook callback for tool completion."""
+    if _reporter:
+        _reporter.on_tool_complete(tool_name, args or {}, result, success)
+
+
+def _on_session_start(**kwargs):
+    """Hook callback for session start."""
+    if _reporter:
+        _reporter.on_session_start()
+
+
+def _on_session_end(**kwargs):
+    """Hook callback for session end."""
+    if _reporter:
+        _reporter.on_session_end()
+
+
+def load(ctx: Any, config: Dict[str, Any], profile_name: Optional[str] = None):
     """
-    Load plugin and return reporter instance.
+    Load plugin and register hooks with Hermes.
     
-    Hermes calls this on startup with the full config dict and profile name.
-    Returns an object with hook methods (on_tool_complete, etc.)
+    Hermes calls this on startup with:
+    - ctx: the Hermes plugin context (provides register_hook())
+    - config: the full hermes config dict
+    - profile_name: the active profile name
+    
+    We register hooks dynamically via ctx.register_hook().
     """
-    star_office_config = hermes_config.get("star_office", {})
-    reporter = StarOfficeReporter(star_office_config, profile_name)
+    global _reporter
     
-    if reporter.enabled:
-        logger.info(f"Star Office Reporter enabled: {reporter.dashboard_url}")
-    else:
+    star_office_config = config.get("star_office", {})
+    _reporter = StarOfficeReporter(star_office_config, profile_name)
+
+    if not _reporter.enabled:
         logger.info("Star Office Reporter disabled")
+        return
+
+    # Register hooks dynamically (Ponytail pattern)
+    ctx.register_hook("post_tool_call", _on_tool_complete)
     
-    return reporter
+    logger.info(f"Star Office Reporter enabled: {_reporter.dashboard_url} (agent: {_reporter.agent_name})")
