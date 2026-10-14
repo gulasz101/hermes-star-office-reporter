@@ -3,7 +3,7 @@ version: 1.0.0
 description: Auto-report Hermes activity to Star Office UI dashboard
 author: Wojciech Gula
 entry_point: plugin.py
-hooks:
+provides_hooks:
   - on_tool_complete
   - on_session_start
   - on_session_end
