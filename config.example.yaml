@@ -1,0 +1,13 @@
+# Example Star Office Reporter config
+# Add this to ~/.hermes/config.yaml
+
+star_office:
+  enabled: true
+  dashboard_url: http://192.168.1.119:19000  # Your dashboard URL (LAN or VPN)
+  agent_name: hermes-szarik                   # Agent identifier
+  report_tool_calls: true                     # Report all tool executions
+  report_file_edits: true                     # Report write_file/patch
+  report_commands: true                       # Report terminal commands
+  report_sessions: true                       # Report session start/end
+  timeout_seconds: 5                          # HTTP timeout
+  retry_on_failure: false                     # Retry on connection failure
