@@ -151,18 +151,18 @@ def _on_session_end(**kwargs):
         _reporter.on_session_end()
 
 
-def load(ctx: Any, config: Dict[str, Any], profile_name: Optional[str] = None):
+def register(ctx: Any):
     """
-    Load plugin and register hooks with Hermes.
+    Register hooks with Hermes.
     
-    Hermes calls this on startup with:
-    - ctx: the Hermes plugin context (provides register_hook())
-    - config: the full hermes config dict
-    - profile_name: the active profile name
-    
-    We register hooks dynamically via ctx.register_hook().
+    Hermes calls this on startup with the plugin context (ctx).
+    ctx has: config, profile_name, register_hook(), etc.
     """
     global _reporter
+    
+    # Get config from ctx
+    config = getattr(ctx, 'config', {}) or {}
+    profile_name = getattr(ctx, 'profile_name', None)
     
     star_office_config = config.get("star_office", {})
     _reporter = StarOfficeReporter(star_office_config, profile_name)
@@ -171,7 +171,7 @@ def load(ctx: Any, config: Dict[str, Any], profile_name: Optional[str] = None):
         logger.info("Star Office Reporter disabled")
         return
 
-    # Register hooks dynamically (Ponytail pattern)
+    # Register the post_tool_call hook
     ctx.register_hook("post_tool_call", _on_tool_complete)
     
     logger.info(f"Star Office Reporter enabled: {_reporter.dashboard_url} (agent: {_reporter.agent_name})")
