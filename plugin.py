@@ -19,11 +19,14 @@ logger = logging.getLogger(__name__)
 class StarOfficeReporter:
     """Reports Hermes events to Star Office UI dashboard."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], profile_name: Optional[str] = None):
         """Initialize reporter with config from ~/.hermes/config.yaml."""
         self.enabled = config.get("enabled", False)
         self.dashboard_url = config.get("dashboard_url", "")
-        self.agent_name = config.get("agent_name", f"hermes-{os.getenv('USER', 'unknown')}")
+        
+        # Auto-detect agent name: hermes-{profile_name} or env fallback
+        default_agent = f"hermes-{profile_name}" if profile_name else f"hermes-{os.getenv('USER', 'unknown')}"
+        self.agent_name = config.get("agent_name", default_agent)
         self.report_tool_calls = config.get("report_tool_calls", True)
         self.report_file_edits = config.get("report_file_edits", True)
         self.report_commands = config.get("report_commands", True)
@@ -123,15 +126,15 @@ class StarOfficeReporter:
 
 
 # Plugin entry point
-def load(hermes_config: Dict[str, Any]) -> StarOfficeReporter:
+def load(hermes_config: Dict[str, Any], profile_name: Optional[str] = None) -> StarOfficeReporter:
     """
     Load plugin and return reporter instance.
     
-    Hermes calls this on startup with the full config dict.
+    Hermes calls this on startup with the full config dict and profile name.
     Returns an object with hook methods (on_tool_complete, etc.)
     """
     star_office_config = hermes_config.get("star_office", {})
-    reporter = StarOfficeReporter(star_office_config)
+    reporter = StarOfficeReporter(star_office_config, profile_name)
     
     if reporter.enabled:
         logger.info(f"Star Office Reporter enabled: {reporter.dashboard_url}")
