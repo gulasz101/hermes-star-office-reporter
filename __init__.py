@@ -11,10 +11,10 @@ import json
 import logging
 import os
 import threading
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-
-import requests
 
 logger = logging.getLogger(__name__)
 
@@ -114,14 +114,21 @@ class StarOfficeReporter:
                 }
 
                 url = f"{self.dashboard_url.rstrip('/')}/events"
-                resp = requests.post(
-                    url, json=event, timeout=self.timeout, headers={"Content-Type": "application/json"}
+                data = json.dumps(event).encode('utf-8')
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
                 )
-                resp.raise_for_status()
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    resp.read()
                 logger.debug(f"Pushed {event_type} to {url}")
 
-            except requests.RequestException as e:
-                logger.warning(f"Failed to push {event_type} to dashboard: {e}")
+            except urllib.error.HTTPError as e:
+                logger.warning(f"Failed to push {event_type} to dashboard: HTTP {e.code}")
+            except urllib.error.URLError as e:
+                logger.warning(f"Failed to push {event_type} to dashboard: {e.reason}")
             except Exception as e:
                 logger.error(f"Unexpected error pushing {event_type}: {e}")
 

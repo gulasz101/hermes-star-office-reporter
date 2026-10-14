@@ -1,1 +1,2 @@
-requests>=2.31.0
+# hermes-star-office-reporter
+# No external dependencies — uses stdlib urllib only
