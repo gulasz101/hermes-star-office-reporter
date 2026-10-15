@@ -1,13 +1,31 @@
-# Example Star Office Reporter config
-# Add this to ~/.hermes/config.yaml
+# Star Office Reporter — settings
+#
+# Put these under `plugins.entries.star-office.settings` in the PROFILE config
+# (~/.hermes/profiles/<profile>/config.yaml). Easiest path — no hand editing:
+#
+#   hermes -p <profile> config set plugins.entries.star-office.settings.dashboard_url http://HOST:19000
+#   hermes -p <profile> config set plugins.entries.star-office.settings.enabled true
+#
+# Why not a top-level block: PluginContext (hermes_cli/plugins.py) exposes NO
+# `.config` attribute. Plugin settings are read with ctx.get_config(key), which
+# resolves `plugins.entries.<plugin_id>.settings.<key>`. A top-level section is
+# invisible to the plugin, so the reporter disables itself silently — the plugin
+# still lists as enabled and logs nothing but "Star Office Reporter disabled".
+#
+# The plugin must also be enabled in the plugins list (`hermes plugins enable star-office`).
 
-star_office:
-  enabled: true
-  dashboard_url: http://192.168.1.119:19000  # Your dashboard URL (LAN or VPN)
-  # agent_name: auto                          # Defaults to hermes-{profile_name}
-  report_tool_calls: true                     # Report all tool executions
-  report_file_edits: true                     # Report write_file/patch
-  report_commands: true                       # Report terminal commands
-  report_sessions: true                       # Report session start/end
-  timeout_seconds: 5                          # HTTP timeout
-  retry_on_failure: false                     # Retry on connection failure
+plugins:
+  entries:
+    star-office:
+      settings:
+        enabled: true
+        dashboard_url: http://192.168.1.119:19000  # dashboard base URL (LAN or VPN)
+
+        # agent_name: my-agent       # Defaults to hermes-{profile_name}
+
+        report_tool_calls: true      # Report all tool executions
+        report_file_edits: true      # Report write_file/patch
+        report_commands: true        # Report terminal commands
+        report_sessions: true        # Report session start/end
+        timeout_seconds: 5           # HTTP timeout
+        retry_on_failure: false      # Retry once on connection failure

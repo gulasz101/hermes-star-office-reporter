@@ -161,17 +161,51 @@ def _on_session_end(**kwargs):
 def register(ctx: Any):
     """
     Register hooks with Hermes.
-    
+
     Hermes calls this on startup with the plugin context (ctx).
-    ctx has: config, profile_name, register_hook(), etc.
+
+    Config contract (verified against hermes_cli/plugins.py + plugins_loader.py,
+    2026-10-15): PluginContext has NO `.config` attribute. Plugin settings live at
+    ``plugins.entries.<plugin_id>.settings.<key>`` and are read with
+    ``ctx.get_config(key, default)`` — that is also what the manifest's
+    ``config_schema`` is validated against. A top-level ``star_office:`` block is
+    NOT visible to the plugin at all, which silently disabled the reporter
+    (readiness was fine, zero events were reported).
     """
     global _reporter
-    
-    # Get config from ctx
-    config = getattr(ctx, 'config', {}) or {}
-    profile_name = getattr(ctx, 'profile_name', None)
-    
-    star_office_config = config.get("star_office", {})
+
+    def _cfg(key: str, default: Any = None) -> Any:
+        getter = getattr(ctx, "get_config", None)
+        if callable(getter):
+            value = getter(key, None)
+            if value is not None:
+                return value
+        # Legacy fallback: top-level `star_office:` block (pre-settings layout).
+        legacy = getattr(ctx, "config", None)
+        if isinstance(legacy, dict):
+            section = legacy.get("star_office") or {}
+            if isinstance(section, dict) and key in section:
+                return section[key]
+        return default
+
+    profile_name = getattr(ctx, "profile_name", None)
+
+    star_office_config: Dict[str, Any] = {
+        "enabled": _cfg("enabled", False),
+        "dashboard_url": _cfg("dashboard_url", ""),
+        "report_tool_calls": _cfg("report_tool_calls", True),
+        "report_file_edits": _cfg("report_file_edits", True),
+        "report_commands": _cfg("report_commands", True),
+        "report_sessions": _cfg("report_sessions", True),
+        "timeout_seconds": _cfg("timeout_seconds", 5),
+        "retry_on_failure": _cfg("retry_on_failure", False),
+    }
+    # Only forward agent_name when it is actually configured — passing None would
+    # defeat the reporter's own default (`hermes-<profile>`).
+    agent_name = _cfg("agent_name", None)
+    if agent_name:
+        star_office_config["agent_name"] = agent_name
+
     _reporter = StarOfficeReporter(star_office_config, profile_name)
 
     if not _reporter.enabled:

@@ -13,28 +13,44 @@ Hooks into Hermes tool execution and pushes events to a remote Star Office UI da
 cd ~/.hermes/plugins
 git clone https://github.com/gulasz101/hermes-star-office-reporter.git star-office
 
-# Configure the dashboard URL
-hermes config set star_office.dashboard_url http://192.168.1.119:19000
-hermes config set star_office.agent_name hermes-$(whoami)
-hermes config set star_office.enabled true
+# Enable the plugin and point it at the dashboard (settings live under
+# plugins.entries.<id>.settings — a top-level section is invisible to the plugin)
+hermes plugins enable star-office
+hermes config set plugins.entries.star-office.settings.dashboard_url http://192.168.1.119:19000
+hermes config set plugins.entries.star-office.settings.enabled true
 ```
 
 ## Configuration
 
-Add to your `~/.hermes/config.yaml`:
+Plugin settings belong under `plugins.entries.star-office.settings` in
+`~/.hermes/profiles/<profile>/config.yaml` (see `config.example.yaml`):
 
 ```yaml
-star_office:
-  enabled: true
-  dashboard_url: http://192.168.1.119:19000  # Your dashboard URL
-  agent_name: hermes-szarik                   # Agent identifier
-  report_tool_calls: true
-  report_file_edits: true
-  report_commands: true
-  report_sessions: true
-  timeout_seconds: 5
-  retry_on_failure: false
+plugins:
+  entries:
+    star-office:
+      settings:
+        enabled: true
+        dashboard_url: http://192.168.1.119:19000  # Your dashboard URL
+        # agent_name: hermes-szarik                 # Defaults to hermes-{profile}
+        report_tool_calls: true
+        report_file_edits: true
+        report_commands: true
+        report_sessions: true
+        timeout_seconds: 5
+        retry_on_failure: false
 ```
+
+**Why not a top-level `star_office:` block:** `PluginContext` (the object passed to
+`register(ctx)`) exposes `get_config(key)`, which resolves
+`plugins.entries.<plugin_id>.settings.<key>` — it has **no `.config` attribute**. A
+top-level section is never read, and the plugin disables itself **silently**: it still
+lists as enabled and the only trace is `Star Office Reporter disabled` in the log.
+Verify the wiring by effect, not by status: after a session that used tools,
+`GET /events/recent` on the dashboard must show your agent's events.
+
+Settings changes need a fresh session/gateway process — the plugin is imported at
+startup.
 
 ## Event schema
 
