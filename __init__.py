@@ -212,7 +212,11 @@ def register(ctx: Any):
         logger.info("Star Office Reporter disabled")
         return
 
-    # Register the post_tool_call hook
+    # Register hooks. Hook names must be Hermes hook names (hermes_cli/plugins.py
+    # VALID_HOOKS) — `on_tool_complete` is the internal callback, not a hook, and
+    # declaring an unknown hook in provides_hooks fails `hermes plugins doctor`.
     ctx.register_hook("post_tool_call", _on_tool_complete)
-    
+    ctx.register_hook("on_session_start", _on_session_start)
+    ctx.register_hook("on_session_end", _on_session_end)
+
     logger.info(f"Star Office Reporter enabled: {_reporter.dashboard_url} (agent: {_reporter.agent_name})")

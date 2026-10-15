@@ -4,7 +4,7 @@ description: Auto-report Hermes activity to Star Office UI dashboard
 author: Wojciech Gula
 entry_point: __init__.py
 provides_hooks:
-  - on_tool_complete
+  - post_tool_call
   - on_session_start
   - on_session_end
 config_schema:
