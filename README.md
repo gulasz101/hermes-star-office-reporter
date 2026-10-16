@@ -89,41 +89,76 @@ Events follow the Star Office UI v1 schema:
   "timestamp": "2026-10-13T20:30:00Z",
   "payload": {
     "tool": "read_file",
-    "path": "backend/app.py",
+    "path": "app.py",
     "success": true
   }
 }
 ```
 
+## What leaves the machine (SOU-192)
+
+Payload values are **labels for a pixel character, not content**. `GET /events/recent`
+has no auth today and the same feed is meant to feed a public view later, so the
+reporter sends the minimum that the renderer can draw from:
+
+| Tool | Sent | Never sent |
+|---|---|---|
+| `terminal` | `command`: the program plus **at most one allow-listed subcommand** — `git push`, `npm run build`, `docker build` | arguments, flags, `key=value` pairs, paths, URLs, `cd` targets, env prefixes |
+| `read_file` | `path`: the **basename** — `app.py` | any directory component or absolute path |
+| `write_file` / `patch` | `path` basename + `bytes` (byte count of `content`) | file contents, `old_string`/`new_string` |
+| `web_search`, `browser_navigate`, others | `tool` + `success` only | the query text, the URL |
+| vault tools (`browser_vault_*`) | nothing at all | — |
+
+The command rule is the same one the Claude Code reporter applies
+(`reporter/claude-code` in `gulasz101/star-office-ui-fork`, SOU-157/173) and the same
+allow-list, so both reporters label a command identically:
+
+```
+git -c user.password=SECRET push   ->  git push
+cd /repo && docker build -t x .    ->  docker build
+npm --silent run build             ->  npm run build
+sudo FOO=bar /usr/bin/env git push ->  git push
+cat notes.txt | grep secret        ->  cat        (not on the allow-list)
+```
+
+Allow-listed programs: `git`, `npm`, `pnpm`, `yarn`, `docker`, `kubectl`, `cargo`,
+`go`, `helm`, `flux`, `make`, `uv`, `pip`, `poetry`. A subcommand must be a bare
+lowercase identifier (`^[a-z][a-z0-9-]{0,20}$`) — anything else is skipped and never
+echoed. `tests/test_command_label.py` pins the table, case for case, against the
+Claude Code suite's.
+
 ## Event types reported
 
-- `tool_call` — After any tool execution
-- `file_edit` — After write_file or patch
-- `command_run` — After terminal commands
-- `session_start` — When Hermes starts
-- `session_end` — When Hermes exits
+- `tool_call` — after any tool execution (a command arrives as `tool: "terminal"`)
+- `session_start` — when a Hermes session starts
+- `session_end` — when a Hermes session ends
+
+`file_edit` and `command_run` belong to the **Claude Code** reporter's vocabulary;
+this one carries a manual file or command as a `tool_call`, which is what the v3
+renderer (`frontend/v3/activity.js`) already maps.
 
 ## Requirements
 
 - Hermes Agent 0.1.0+
-- Python 3.10+
-- Requests library (auto-installed)
+- Python 3.9+ — **stdlib only**, no external dependencies
 
 ## Security
 
 - Never sends credentials or secrets in event payloads
-- Respects Hermes vault privacy (no password/token values)
+- Respects Hermes vault privacy (vault tools are dropped entirely)
+- Commands are reduced to program + allow-listed subcommand; files to basenames;
+  search queries and URLs are not sent at all (see "What leaves the machine")
 - Dashboard URL should be internal network or VPN-only until auth is implemented
 
 ## Development
 
 ```bash
-# Run tests
-pytest tests/
+# Run tests (stdlib unittest — no pytest needed)
+python3 -m unittest discover -s tests -v
 
 # Lint
-black plugin.py
-mypy plugin.py
+black __init__.py
+mypy __init__.py
 ```
 
 ## License

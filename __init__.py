@@ -18,6 +18,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import threading
 import urllib.request
 import urllib.error
@@ -26,6 +27,154 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------- sanitising --
+# SOU-192: payload values are *labels for a pixel character*, not content. The
+# Claude Code reporter (``reporter/claude-code``, SOU-157/173) already sends a
+# program plus at most one allow-listed subcommand and a file *basename*; these
+# primitives are ported from it verbatim (same regexes, same tables) so the two
+# reporters emit the SAME label for the same command and cannot drift apart.
+#
+# Why it matters: the v3 renderer sanitises before drawing a bubble, so nothing
+# user-visible leaked — but the raw strings sat in the event DB and came back
+# from ``GET /events/recent``, which has no auth.
+
+MAX_VALUE_CHARS = 120
+
+# Wrappers that are not the program the agent actually ran.
+COMMAND_WRAPPERS = {"sudo", "doas", "env", "time", "nohup", "command", "nice", "timeout"}
+# `timeout 300 cmd` / `timeout 5m cmd`: the duration is the wrapper's argument, not the program.
+DURATION = re.compile(r"^[0-9]+(\.[0-9]+)?[smhd]?$")
+# Directory changes chained in front of the real work (`cd /repo && git push`) are
+# skipped; a command that is only a `cd` still reports as `cd`. The directory is
+# never sent.
+DIR_CHANGERS = {"cd", "pushd"}
+SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|]")
+PYTHONS = re.compile(r"^python[0-9.]*$")
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+PROGRAM = re.compile(r"^[A-Za-z0-9._+-]{1,32}$")
+TOKEN_SPLIT = re.compile(r"\s+")
+
+# Programs allowed to carry one subcommand token in the label. Mirrors the
+# Claude Code reporter, which mirrors frontend/v3/activity.js.
+SUBCOMMAND_PROGRAMS = {
+    "git", "npm", "pnpm", "yarn", "docker", "kubectl", "cargo", "go",
+    "helm", "flux", "make", "uv", "pip", "poetry",
+}
+# npm/pnpm/yarn need `run <script>` as TWO tokens: activity.js computes the
+# runner verb from the token after "run", so a lone "npm run" would classify
+# `npm run build` as ops instead of the garage.
+RUNNER_PROGRAMS = {"npm", "pnpm", "yarn"}
+# A subcommand is a bare lowercase identifier, never a flag, path, URL,
+# key=value pair or value. Anything that does not match is skipped and not
+# echoed — this regex is the whole privacy boundary of the feature.
+SUBCOMMAND = re.compile(r"^[a-z][a-z0-9-]{0,20}$")
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def text_of(value: Any, limit: int = MAX_VALUE_CHARS) -> str:
+    """A trimmed, control-character-free string, or "" for anything else."""
+    if isinstance(value, str):
+        return _CONTROL_CHARS.sub(" ", value).strip()[:limit]
+    return ""
+
+
+def basename(value: Any) -> str:
+    """Last path segment only — the whole path is the thing we must not send."""
+    raw = text_of(value, 1024)
+    if not raw:
+        return ""
+    normalised = raw.replace("\\", "/")
+    parts = [part for part in normalised.split("/") if part not in ("", ".")]
+    if not parts:
+        return ""
+    last = parts[-1]
+    if last in {"..", "/"} or "\x00" in last:
+        return ""
+    # A drive letter or a leftover separator means we did not get a basename.
+    if ":" in last or "/" in last or "\\" in last:
+        return ""
+    return last[:MAX_VALUE_CHARS]
+
+
+def command_parts(command: Any):
+    """First real command -> ``(program, [arguments after it])``.
+
+    Leading ``cd``/``pushd`` segments are skipped when something follows them.
+    Env prefixes (``FOO=bar``), wrapper tokens (``sudo``, ``env``, ``timeout 300`` …)
+    and flags are skipped while finding the program; ``python -m <module>`` reports
+    the module. Nothing usable -> ``("shell", [])``.
+    """
+    raw = text_of(command, 4096)
+    if not raw:
+        return "", []
+    segments = [seg for seg in SEGMENT_SPLIT.split(raw) if seg.strip()]
+    parsed = None
+    for seg in segments:
+        parsed = _segment_parts(seg)
+        if parsed[0] not in DIR_CHANGERS:
+            return parsed
+    return parsed or ("shell", [])
+
+
+def _segment_parts(segment: str):
+    tokens = [token for token in TOKEN_SPLIT.split(segment.strip()) if token]
+    skip_duration = False
+    for index, token in enumerate(tokens):
+        if skip_duration and DURATION.match(token):
+            skip_duration = False
+            continue
+        if ASSIGNMENT.match(token) or token.startswith("-"):
+            continue  # env assignment or a flag of the wrapper
+        name = basename(token.replace("\\", "/")) or token
+        name = name.split("/")[-1]
+        if name in COMMAND_WRAPPERS:
+            skip_duration = name == "timeout"
+            continue
+        if not PROGRAM.match(name) or ":" in name:
+            return "shell", []
+        rest = tokens[index + 1:]
+        if PYTHONS.match(name) and len(rest) >= 2 and rest[0] == "-m" and PROGRAM.match(rest[1]):
+            return rest[1], rest[2:]
+        return name, rest
+    return "shell", []
+
+
+def program(command: Any) -> str:
+    """Program name of a shell command: first segment, first real token.
+
+    Never arguments, never a path. `sudo -u x npm i` -> `npm`;
+    `FOO=bar ./bin/run.sh -v` -> `run.sh`; nothing usable -> `shell`.
+    """
+    return command_parts(command)[0]
+
+
+def command_label(command: Any) -> str:
+    """Privacy-safe label: the program plus ONE allow-listed subcommand (SOU-192).
+
+    ``git push origin main`` -> ``git push``, ``docker build -t x .`` ->
+    ``docker build``, ``npm run build`` -> ``npm run build`` (runner programs keep
+    the script verb, two tokens). The subcommand is the first argument that is a
+    bare lowercase identifier; flags and value-ish tokens (``key=value``, paths,
+    URLs, uppercase) are skipped and never echoed. Programs outside
+    ``SUBCOMMAND_PROGRAMS`` keep program-name-only behaviour, so
+    ``git -c user.password=SECRET push`` -> ``git push`` and nothing else about
+    that command leaves the machine.
+    """
+    prog, args = command_parts(command)
+    if not prog or prog.lower() not in SUBCOMMAND_PROGRAMS:
+        return prog
+    picked = []
+    for token in args:
+        if token.startswith("-") or not SUBCOMMAND.match(token):
+            continue  # a flag or a value: never a subcommand, never echoed
+        picked.append(token)
+        want = 2 if prog.lower() in RUNNER_PROGRAMS and picked[0] == "run" else 1
+        if len(picked) >= want:
+            break
+    return " ".join([prog] + picked)
 
 
 def _profile_from_home(home: Any) -> Optional[str]:
@@ -188,26 +337,31 @@ class StarOfficeReporter:
         if not self.report_tool_calls:
             return
 
-        # Build payload (sanitized)
+        # Build payload. Values are labels, never content (SOU-192): a terminal
+        # command is reduced to program + one allow-listed subcommand, a file to
+        # its basename. Both are the same rules the Claude Code reporter sends,
+        # and neither contains a path.
         payload = {
             "tool": tool_name,
             "success": success,
         }
 
-        # Add safe args (never credentials)
         if tool_name == "read_file":
-            payload["path"] = args.get("path", "")
+            name = basename(args.get("path"))
+            if name:
+                payload["path"] = name
         elif tool_name in ("write_file", "patch"):
-            payload["path"] = args.get("path", "")
-            payload["bytes"] = len(args.get("content", ""))
+            name = basename(args.get("path"))
+            if name:
+                payload["path"] = name
+            content = args.get("content")
+            payload["bytes"] = len(content) if isinstance(content, str) else 0
         elif tool_name == "terminal":
-            cmd = args.get("command", "")
-            # Truncate long commands
-            payload["command"] = cmd[:100] + "..." if len(cmd) > 100 else cmd
-        elif tool_name == "web_search":
-            payload["query"] = args.get("query", "")
-        elif tool_name == "browser_navigate":
-            payload["url"] = args.get("url", "")
+            payload["command"] = command_label(args.get("command")) or "shell"
+        # Anything else (web_search, browser_navigate, MCP tools, …) reports the
+        # tool name and status only: /events/recent has no auth, and the renderer
+        # (frontend/v3/activity.js) reads no other field — a search query or a
+        # navigation URL is user content with no consumer.
 
         self._push_event("tool_call", payload, session_id)
 

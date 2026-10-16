@@ -205,19 +205,26 @@ class PushPathTest(unittest.TestCase):
         finally:
             reporter_module._bound_profile_home = original
 
-        # The pushes happen on daemon threads; wait for them.
+        # The pushes happen on daemon threads and their ARRIVAL ORDER is not
+        # guaranteed (this raced on the plugin's own Python 3.14 runtime: 1 run
+        # in 3 saw ['tool_call', 'session_start']). What the test is about is
+        # WHICH events reach the dashboard and how they are labelled, not their
+        # interleaving — so compare as a multiset.
         for _ in range(100):
             if len(events) >= 2:
                 break
             threading.Event().wait(0.05)
 
-        kinds = [event["event_type"] for _path, event in events]
+        kinds = sorted(event["event_type"] for _path, event in events)
         self.assertEqual(kinds, ["session_start", "tool_call"])
         self.assertTrue(all(path == "/events" for path, _ in events))
         for _path, event in events:
             self.assertEqual(event["agent"], "hermes-szarik")
             self.assertEqual(event["version"], 1)
-        self.assertEqual(events[1][1]["payload"]["command"], "date -u")
+        # SOU-192: the wire carries a label, not the command line — the allow-list
+        # has no entry for `date`, so the argument is dropped like every other.
+        by_kind = {event["event_type"]: event["payload"] for _path, event in events}
+        self.assertEqual(by_kind["tool_call"]["command"], "date")
         # Vault tools must never be reported.
         self.assertNotIn("browser_vault_fill", json.dumps(events))
 
