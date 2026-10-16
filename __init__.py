@@ -3,10 +3,18 @@ Hermes Star Office Reporter Plugin
 
 Auto-reports Hermes tool activity to a Star Office UI dashboard.
 
-Hook registration follows Ponytail's pattern: load() receives ctx and calls
-ctx.register_hook() to dynamically register hooks.
+Hook registration follows the plugin API: load() receives ctx and calls
+ctx.register_hook() to register hooks.
+
+Profile identity (SOU-189): a multiplexed gateway process serves several profiles
+from ONE process, so the plugin instance loaded here may see sessions that belong to
+a different profile than the one the process launched with. The agent name is
+therefore resolved PER SESSION at hook time from the home the routed turn binds
+(contextvars), falling back to the profile this instance was loaded from. The
+`agent_name` setting, when set, overrides everything.
 """
 
+import importlib
 import json
 import logging
 import os
@@ -14,28 +22,109 @@ import threading
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _profile_from_home(home: Any) -> Optional[str]:
+    """Profile name a Hermes home path stands for: ``"default"``, ``"<name>"`` or ``None``.
+
+    Mirrors ``hermes_cli.profiles.get_active_profile_name()``'s rule (the root home is
+    ``default``; ``<root>/profiles/<name>`` is that profile) without importing it, so the
+    plugin keeps working if the internals move.
+    """
+    if not home:
+        return None
+    try:
+        path = Path(str(home)).expanduser().resolve()
+    except Exception:
+        return None
+    root: Optional[Path] = None
+    try:
+        from hermes_constants import get_default_hermes_root  # type: ignore
+
+        root = Path(get_default_hermes_root()).expanduser().resolve()
+    except Exception:
+        root = None
+    if root is None:
+        env_root = (os.environ.get("HERMES_HOME") or "").strip()
+        root = Path(env_root).expanduser().resolve() if env_root else (Path.home() / ".hermes")
+    if path == root:
+        return "default"
+    try:
+        relative = path.relative_to(root / "profiles")
+    except ValueError:
+        return None
+    return relative.parts[0] if relative.parts else None
+
+
+def _bound_profile_home() -> Optional[str]:
+    """Home the CURRENT session is scoped to, from the signals a routed turn binds.
+
+    A multiplexed gateway scopes a routed turn by binding the profile's home (and its
+    secret scope) as contextvars; an unscoped session falls through to the process's own
+    home. First hit wins, ``get_hermes_home`` last.
+    """
+    for module_name, attribute in (
+        ("hermes_constants", "get_hermes_home_override"),
+        ("agent.secret_scope", "current_secret_scope_home"),
+        ("hermes_constants", "get_hermes_home"),
+    ):
+        try:
+            value = getattr(importlib.import_module(module_name), attribute)()
+        except Exception:
+            continue
+        if value:
+            return str(value)
+    return None
+
+
+def _session_profile(load_profile: Optional[str]) -> Optional[str]:
+    """Profile the current session runs FOR, else the profile this instance was loaded from.
+
+    The env pins (``HERMES_PROFILE_NAME``/``HERMES_PROFILE``) are consulted only when the
+    bound home says nothing: ``os.environ`` belongs to the LAUNCH profile, so under a
+    routed turn it would relabel another profile's work as the host's.
+    """
+    profile = _profile_from_home(_bound_profile_home())
+    if profile:
+        return profile
+    for env_name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = (os.environ.get(env_name) or "").strip()
+        if value:
+            return value
+    return load_profile
 
 
 class StarOfficeReporter:
     """Reports Hermes events to Star Office UI dashboard."""
 
     def __init__(self, config: Dict[str, Any], profile_name: Optional[str] = None):
-        """Initialize reporter with config from ~/.hermes/config.yaml."""
+        """Initialize reporter with config from the plugin settings block."""
         self.enabled = config.get("enabled", False)
         self.dashboard_url = config.get("dashboard_url", "")
-        
-        # Auto-detect agent name: hermes-{profile_name} or env fallback
-        default_agent = f"hermes-{profile_name}" if profile_name else f"hermes-{os.getenv('USER', 'unknown')}"
-        self.agent_name = config.get("agent_name", default_agent)
+
+        # Profile this plugin instance was loaded from; the per-session resolution
+        # below overrides it whenever the session's own profile can be told.
+        self.profile_name = profile_name or "default"
+
+        configured_agent_name = str(config.get("agent_name") or "").strip()
+        self._agent_name_override = configured_agent_name
+        self.agent_name = configured_agent_name or f"hermes-{self.profile_name}"
+
         self.report_tool_calls = config.get("report_tool_calls", True)
         self.report_file_edits = config.get("report_file_edits", True)
         self.report_commands = config.get("report_commands", True)
         self.report_sessions = config.get("report_sessions", True)
         self.timeout = config.get("timeout_seconds", 5)
         self.retry = config.get("retry_on_failure", False)
+
+        # Sessions already logged, so the resolution is reported once per session
+        # without flooding the log at tool-call rate.
+        self._seen_sessions: Dict[str, str] = {}
+        self._seen_lock = threading.Lock()
 
         # Privacy filters: never report these tool names
         self._secret_tools = {
@@ -48,8 +137,39 @@ class StarOfficeReporter:
             logger.warning("star_office enabled but dashboard_url not set")
             self.enabled = False
 
+    def agent_name_for_session(self, session_id: Optional[str] = None) -> str:
+        """Agent name this session's events are reported under.
+
+        Precedence: explicit ``agent_name`` setting > the profile this session runs for
+        (resolved per session, so a multiplexed gateway's routed turns report as their
+        own agent) > the profile this plugin instance was loaded from.
+        """
+        if self._agent_name_override:
+            return self._agent_name_override
+        profile = _session_profile(self.profile_name)
+        name = f"hermes-{profile}" if profile else self.agent_name
+
+        key = str(session_id or "")
+        with self._seen_lock:
+            first = key not in self._seen_sessions
+            if first:
+                self._seen_sessions[key] = name
+                if len(self._seen_sessions) > 512:  # bound the bookkeeping
+                    self._seen_sessions.pop(next(iter(self._seen_sessions)))
+        if first:
+            logger.info(
+                "star_office: session %s reports as %s (plugin profile: %s)",
+                key or "<none>", name, self.profile_name,
+            )
+        return name
+
     def on_tool_complete(
-        self, tool_name: str, args: Dict[str, Any], result: Any, success: bool
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        result: Any,
+        success: bool,
+        session_id: Optional[str] = None,
     ):
         """Called after every tool execution."""
         if not self.enabled:
@@ -89,25 +209,29 @@ class StarOfficeReporter:
         elif tool_name == "browser_navigate":
             payload["url"] = args.get("url", "")
 
-        self._push_event("tool_call", payload)
+        self._push_event("tool_call", payload, session_id)
 
-    def on_session_start(self):
+    def on_session_start(self, session_id: Optional[str] = None):
         """Called when Hermes session starts."""
         if self.enabled and self.report_sessions:
-            self._push_event("session_start", {})
+            self._push_event("session_start", {}, session_id)
 
-    def on_session_end(self):
+    def on_session_end(self, session_id: Optional[str] = None):
         """Called when Hermes session ends."""
         if self.enabled and self.report_sessions:
-            self._push_event("session_end", {})
+            self._push_event("session_end", {}, session_id)
 
-    def _push_event(self, event_type: str, payload: Dict[str, Any]):
+    def _push_event(
+        self, event_type: str, payload: Dict[str, Any], session_id: Optional[str] = None
+    ):
         """Push event to dashboard (non-blocking)."""
+        agent_name = self.agent_name_for_session(session_id)
+
         def _do_push():
             try:
                 event = {
                     "version": 1,
-                    "agent": self.agent_name,
+                    "agent": agent_name,
                     "event_type": event_type,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "payload": payload,
@@ -136,26 +260,27 @@ class StarOfficeReporter:
         threading.Thread(target=_do_push, daemon=True).start()
 
 
-# Singleton reporter instance (set by load())
+# Singleton reporter instance (set by register())
 _reporter: Optional[StarOfficeReporter] = None
 
 
-def _on_tool_complete(tool_name: str = "", args: Any = None, result: Any = None, success: bool = True, **kwargs):
+def _on_tool_complete(tool_name: str = "", args: Any = None, result: Any = None,
+                      success: bool = True, session_id: str = "", **kwargs):
     """Hook callback for tool completion."""
     if _reporter:
-        _reporter.on_tool_complete(tool_name, args or {}, result, success)
+        _reporter.on_tool_complete(tool_name, args or {}, result, success, session_id=session_id)
 
 
-def _on_session_start(**kwargs):
+def _on_session_start(session_id: str = "", **kwargs):
     """Hook callback for session start."""
     if _reporter:
-        _reporter.on_session_start()
+        _reporter.on_session_start(session_id)
 
 
-def _on_session_end(**kwargs):
+def _on_session_end(session_id: str = "", **kwargs):
     """Hook callback for session end."""
     if _reporter:
-        _reporter.on_session_end()
+        _reporter.on_session_end(session_id)
 
 
 def register(ctx: Any):

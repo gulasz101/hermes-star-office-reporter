@@ -49,8 +49,33 @@ lists as enabled and the only trace is `Star Office Reporter disabled` in the lo
 Verify the wiring by effect, not by status: after a session that used tools,
 `GET /events/recent` on the dashboard must show your agent's events.
 
-Settings changes need a fresh session/gateway process — the plugin is imported at
-startup.
+Settings changes do **not** reach an already-running process — plugins are discovered once
+per process, and a long-lived gateway keeps the registration it read at boot. In a
+multiplexed gateway (one process serving several profiles) that is a silent trap: the
+reporter can stay `disabled` in memory hours after the settings say `enabled`. Make an
+enable/settings change land in a running gateway with:
+
+```bash
+hermes plugins enable star-office     # nudges the running gateway over its control socket
+```
+
+which forces plugin re-discovery in the live process and re-wires its adapters. Verify by
+effect — the plugin's own log line plus event rows on the dashboard — never by config alone.
+A gateway restart also does it, and is the only option for a gateway that predates the
+control-socket reload verb.
+
+## Which agent name is reported
+
+`hermes-{profile}` of the profile the **session** runs for, resolved per session at event
+time — a multiplexed gateway process serves several profiles, and each session tells the
+plugin which one it is (the routed turn binds that profile's home):
+
+- routed/CLI session for profile `szarik` → `hermes-szarik`
+- a session in the root home → `hermes-default`
+- an explicit `agent_name` setting overrides all of it
+
+So one process, one plugin, many profiles — and the dashboard does not end up with a second
+office for work that belongs to a named profile.
 
 ## Event schema
 
