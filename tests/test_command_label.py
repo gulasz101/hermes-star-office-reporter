@@ -110,6 +110,15 @@ WRAPPERS = [
     ("  /usr/bin/env FOO=bar npm run build ", "npm run build"),
 ]
 
+# The three cases the SOU-192 hand-off comment names verbatim. Same shapes as the
+# Claude Code suite's, pinned here so a later edit to the label code cannot
+# quietly regress them.
+DELEGATION_CASES = [
+    ("git -c user.password=X push", "git push"),
+    ("cd /secret && kubectl get secret foo -o yaml", "kubectl get"),
+    ("curl -H 'Authorization: Bearer X' https://host/path?q", "curl"),
+]
+
 # Outside the allow-list: program name only, exactly as before.
 NOT_ALLOWED = [
     ("rm -rf /tmp/x", "rm"),
@@ -145,11 +154,13 @@ CD_AND_WRAPPERS = [
     ('cd ~/.hermes/hermes-agent && grep -n "sync" -A 12 hermes_cli.py', "grep"),
 ]
 
-ALL_CASES = ALLOWED + RUNNERS + PRIVACY + WRAPPERS + NOT_ALLOWED + SEGMENTS + CD_AND_WRAPPERS
+ALL_CASES = (ALLOWED + RUNNERS + PRIVACY + DELEGATION_CASES + WRAPPERS
+             + NOT_ALLOWED + SEGMENTS + CD_AND_WRAPPERS)
 
 # Secrets that appear in the cases above and must never reach the wire.
 SECRETS_IN_CASES = ["/home/me/repo", "/tmp", "s3cr3t", "/only/here", ".venv", "TOKEN", "SECRET",
-                    "user.password", "credential.helper"]
+                    "user.password", "credential.helper",
+                    "/secret", "Bearer", "https://host"]
 
 
 def walk(node, path="payload"):
@@ -251,6 +262,12 @@ class CommandLabelTest(ReporterHarness):
 
     def test_privacy_cases_never_echo_a_value(self):
         for command, expected in PRIVACY:
+            with self.subTest(command=command):
+                self.assertEqual(self.label(command), expected)
+
+    def test_delegation_comment_cases_verbatim(self):
+        """The three cases named in the SOU-192 hand-off comment, verbatim."""
+        for command, expected in DELEGATION_CASES:
             with self.subTest(command=command):
                 self.assertEqual(self.label(command), expected)
 
