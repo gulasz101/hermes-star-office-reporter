@@ -23,6 +23,13 @@ plugins:
 
         # agent_name: my-agent       # Defaults to hermes-{profile_name}
 
+        # Per-agent ingest token (SOU-222). Sent as `Authorization: Bearer`, never
+        # logged. Needed once the dashboard runs with SOU_INGEST_TOKENS set —
+        # `python backend/tokens.py new <agent>` in the fork prints it once.
+        # Provision it from SOPS at deploy time; never commit a real value here.
+        # Falls back to the STAR_OFFICE_TOKEN environment variable when unset.
+        # token: "…"
+
         report_tool_calls: true      # Report all tool executions
         report_file_edits: true      # Report write_file/patch
         report_commands: true        # Report terminal commands

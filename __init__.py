@@ -6,6 +6,15 @@ Auto-reports Hermes tool activity to a Star Office UI dashboard.
 Hook registration follows the plugin API: load() receives ctx and calls
 ctx.register_hook() to register hooks.
 
+Ingest auth (SOU-222, Phase 13 P13-E): once the dashboard runs with
+``SOU_INGEST_TOKENS`` (P13-B, ``backend/ingest_auth.py`` in the fork), ``POST
+/events`` only accepts a request carrying ``Authorization: Bearer <token>``,
+and the token decides which agent's room the envelope may write (401 unknown,
+403 another agent, 429 rate limited). The token is therefore read from the
+profile's plugin settings (``plugins.entries.star-office.settings.token``, the
+place SOPS-managed deployment puts it) or from ``STAR_OFFICE_TOKEN``, sent as
+that header, and never written to a log line — see ``redact()``.
+
 Profile identity (SOU-189): a multiplexed gateway process serves several profiles
 from ONE process, so the plugin instance loaded here may see sessions that belong to
 a different profile than the one the process launched with. The agent name is
@@ -27,6 +36,80 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------- ingest auth --
+# SOU-222 (Phase 13 P13-E). The dashboard's POST /events door is token-protected
+# once SOU_INGEST_TOKENS is set (P13-B): ``Authorization: Bearer <token>``, the
+# token decides which agent the envelope may write, 401 unknown / 403 another
+# agent / 429 rate limited. The token is a secret with two consequences the code
+# below has to honour: it is sent (never stored, never echoed in a payload) and
+# it never reaches a log line — a journal outlives the session, so a token in a
+# debug line is a leaked token.
+
+# The setting name in the plugin's own skill/docs; kept first so it is preferred.
+TOKEN_ENV_ALIASES = ("STAR_OFFICE_TOKEN", "STAR_OFFICE_API_KEY")
+REDACTED = "***"
+# Matches the credential itself, wherever it shows up in a string we log.
+_BEARER_VALUE = re.compile(r"(?i)\bbearer\s+\S+")
+
+
+def token_from_environ(environ=None):
+    """``(token, source)`` from the environment; ``("", None)`` when unset.
+
+    The first non-blank alias wins. Both names are accepted on purpose: the
+    plugin skill documented ``STAR_OFFICE_API_KEY`` before the field had a
+    name, and a profile that followed that doc with no match here would be
+    silently unauthenticated against a locked dashboard.
+    """
+    environ = os.environ if environ is None else environ
+    for name in TOKEN_ENV_ALIASES:
+        value = str(environ.get(name) or "").strip()
+        if value:
+            return value, name
+    return "", None
+
+
+def resolve_token(setting_value=None, environ=None):
+    """``(token, source)``: the explicit per-profile setting, else the environment.
+
+    Precedence follows specificity: the setting is scoped to one profile in one
+    home, the environment variable belongs to the process — which, under a
+    multiplexed gateway, serves several profiles at once.
+    """
+    token = str(setting_value or "").strip()
+    if token:
+        return token, "setting"
+    return token_from_environ(environ)
+
+
+def redact(text, *secrets):
+    """``text`` with every secret and every ``Bearer <value>`` run replaced.
+
+    Applied to every log line that interpolates dynamic data. Empty secrets are
+    ignored so callers can pass their token in unconditionally, which is what
+    keeps a later edit from "just" adding an f-string that leaks it.
+    """
+    out = str(text)
+    for secret in secrets:
+        if secret:
+            out = out.replace(str(secret), REDACTED)
+    return _BEARER_VALUE.sub(f"Bearer {REDACTED}", out)
+
+
+def http_hint(code):
+    """What a dashboard HTTP status means for the reporter, minus any secret."""
+    if code == 401:
+        return (" - the dashboard requires an ingest token: set the `token` setting "
+                "(plugins.entries.star-office.settings.token) or STAR_OFFICE_TOKEN to a "
+                "current `backend/tokens.py new <agent>` value")
+    if code == 403:
+        return (" - this token writes another agent's room: the token must be bound to "
+                "the agent name in the envelope")
+    if code == 429:
+        return " - rate limited by the dashboard (per-token bucket)"
+    if 500 <= code < 600:
+        return " - dashboard error, the event was not stored"
+    return ""
 
 
 # --------------------------------------------------------------- sanitising --
@@ -255,6 +338,14 @@ class StarOfficeReporter:
         self.enabled = config.get("enabled", False)
         self.dashboard_url = config.get("dashboard_url", "")
 
+        # Ingest token (SOU-222). Held for the process's lifetime because every
+        # push needs it; never logged, never put in a payload.
+        self.token = str(config.get("token") or "").strip()
+        self.token_source = config.get("token_source") or ("setting" if self.token else None)
+        # Registered secrets: every log line that carries dynamic data goes
+        # through _safe(), so a future edit cannot leak by accident.
+        self._secrets = tuple(secret for secret in (self.token,) if secret)
+
         # Profile this plugin instance was loaded from; the per-session resolution
         # below overrides it whenever the session's own profile can be told.
         self.profile_name = profile_name or "default"
@@ -285,6 +376,32 @@ class StarOfficeReporter:
         if self.enabled and not self.dashboard_url:
             logger.warning("star_office enabled but dashboard_url not set")
             self.enabled = False
+
+        if self.enabled and not self.token:
+            # Not fatal: an unconfigured dashboard accepts unauthenticated writes
+            # (P13-B), so every profile keeps reporting until the tokens are
+            # provisioned. Loud once at boot, because the day the dashboard is
+            # locked this is the line that explains the 401s.
+            logger.warning(
+                "star_office: no ingest token configured - POST /events goes out "
+                "unauthenticated. Set the `token` setting "
+                "(plugins.entries.star-office.settings.token) or STAR_OFFICE_TOKEN "
+                "once the dashboard enforces tokens."
+            )
+
+    def _safe(self, text: Any) -> str:
+        """A log-ready string: the token can never survive this call."""
+        return redact(text, *self._secrets)
+
+    def auth_headers(self) -> Dict[str, str]:
+        """The extra request headers: Bearer token when configured, else none.
+
+        Public so a test (or a live probe) can assert exactly what goes on the
+        wire without reading a private attribute.
+        """
+        if not self.token:
+            return {}
+        return {"Authorization": f"Bearer {self.token}"}
 
     def agent_name_for_session(self, session_id: Optional[str] = None) -> str:
         """Agent name this session's events are reported under.
@@ -393,22 +510,30 @@ class StarOfficeReporter:
 
                 url = f"{self.dashboard_url.rstrip('/')}/events"
                 data = json.dumps(event).encode('utf-8')
+                headers = {"Content-Type": "application/json"}
+                # SOU-222: the token rides in the header, never in the URL and
+                # never in the envelope — a token in either is a token in a log
+                # or in /events/recent.
+                headers.update(self.auth_headers())
                 req = urllib.request.Request(
                     url,
                     data=data,
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                     method="POST"
                 )
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     resp.read()
-                logger.debug(f"Pushed {event_type} to {url}")
+                logger.debug(self._safe(f"Pushed {event_type} to {url}"))
 
             except urllib.error.HTTPError as e:
-                logger.warning(f"Failed to push {event_type} to dashboard: HTTP {e.code}")
+                logger.warning(
+                    self._safe(f"Failed to push {event_type} to dashboard: HTTP {e.code}"
+                               f"{http_hint(e.code)}")
+                )
             except urllib.error.URLError as e:
-                logger.warning(f"Failed to push {event_type} to dashboard: {e.reason}")
+                logger.warning(self._safe(f"Failed to push {event_type} to dashboard: {e.reason}"))
             except Exception as e:
-                logger.error(f"Unexpected error pushing {event_type}: {e}")
+                logger.error(self._safe(f"Unexpected error pushing {event_type}: {e}"))
 
         # Push in background thread to not block Hermes
         threading.Thread(target=_do_push, daemon=True).start()
@@ -469,9 +594,16 @@ def register(ctx: Any):
 
     profile_name = getattr(ctx, "profile_name", None)
 
+    # SOU-222: the per-profile setting wins, the environment is the fallback.
+    # resolve_token() returns the source *name* only, so the log line below can
+    # say where the token came from without ever holding its value.
+    token, token_source = resolve_token(_cfg("token", None))
+
     star_office_config: Dict[str, Any] = {
         "enabled": _cfg("enabled", False),
         "dashboard_url": _cfg("dashboard_url", ""),
+        "token": token,
+        "token_source": token_source,
         "report_tool_calls": _cfg("report_tool_calls", True),
         "report_file_edits": _cfg("report_file_edits", True),
         "report_commands": _cfg("report_commands", True),
@@ -498,4 +630,9 @@ def register(ctx: Any):
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
 
-    logger.info(f"Star Office Reporter enabled: {_reporter.dashboard_url} (agent: {_reporter.agent_name})")
+    logger.info(
+        "Star Office Reporter enabled: %s (agent: %s, ingest token: %s)",
+        _reporter.dashboard_url,
+        _reporter.agent_name,
+        f"from {_reporter.token_source or 'setting'}" if _reporter.token else "none",
+    )

@@ -33,6 +33,7 @@ plugins:
         enabled: true
         dashboard_url: http://192.168.1.119:19000  # Your dashboard URL
         # agent_name: hermes-szarik                 # Defaults to hermes-{profile}
+        # token: "…"                                # Per-agent ingest token (see below)
         report_tool_calls: true
         report_file_edits: true
         report_commands: true
@@ -76,6 +77,68 @@ plugin which one it is (the routed turn binds that profile's home):
 
 So one process, one plugin, many profiles — and the dashboard does not end up with a second
 office for work that belongs to a named profile.
+
+## Ingest tokens (SOU-222, Phase 13 P13-E)
+
+Once the dashboard runs with `SOU_INGEST_TOKENS` set, its `POST /events` door is locked:
+the request must carry `Authorization: Bearer <token>`, and the token (not the envelope)
+decides which agent's room may be written. The reporter sends the token for its own
+profile:
+
+```yaml
+plugins:
+  entries:
+    star-office:
+      settings:
+        token: "<the value for this profile's agent>"
+```
+
+or via the environment, which is how a container gets it from SOPS:
+
+```bash
+export STAR_OFFICE_TOKEN="<the value for this profile's agent>"
+```
+
+**Precedence:** the per-profile `token` setting wins; `STAR_OFFICE_TOKEN` is the fallback.
+`STAR_OFFICE_API_KEY` is accepted as a legacy alias for the same variable, because the
+reporter skill documented that name before this field existed — a profile that followed it
+must not end up silently sending unauthenticated writes to a locked dashboard.
+
+Mint the value with the fork's CLI, which prints it **once** and stores only its sha256:
+
+```bash
+cd <the star-office-ui-fork checkout>
+uv run python backend/tokens.py new hermes-szarik     # <- the `agent` is the reported name
+```
+
+Reporter behaviour around the token:
+
+| Situation | What happens |
+|---|---|
+| token configured | `Authorization: Bearer <token>` on every `POST /events` |
+| no token configured | the header is omitted and one **warning** is logged at boot — the door stays open on an un-tokened LAN box, so nothing breaks before the tokens are provisioned |
+| `401` | the reporter logs `HTTP 401 - the dashboard requires an ingest token …` and fails open (the turn continues) |
+| `403` | `HTTP 403 - this token writes another agent's room …`: the token's agent must equal the reported `agent` (`hermes-<profile>`) |
+| `429` | `HTTP 429 - rate limited` (per-token bucket); drop reporting or raise `SOU_INGEST_RATE_LIMIT` server-side |
+
+**The token is a secret and the reporter treats it as one:** it is never logged — not at
+INFO, not at DEBUG, not in a rejection warning — and never put in the payload or the URL.
+Every log line that carries dynamic data goes through `redact()`, which masks the token and
+any `Bearer <value>` run, so a debug line stays safe even if it is handed a header dump.
+The value itself is never written to disk or to the repo; deployment sources it from SOPS.
+
+Verify it end to end (real Flask backend with a real `SOU_INGEST_TOKENS` store, real
+`POST /events`):
+
+```bash
+python3 tools/live_ingest_check.py --fork ~/Projects/star-office-ui-fork
+```
+
+The script mints throwaway tokens, starts a scratch backend on a free port with its own
+SQLite file, drives the REAL reporter at it for four cases (token → 201 and stored; unknown
+token → 401; another agent's token → 403; no token against an open backend → 201), reads the
+events back through `GET /events/recent` as the independent oracle, and then removes the
+scratch directory. It prints no token.
 
 ## Event schema
 
@@ -144,17 +207,23 @@ renderer (`frontend/v3/activity.js`) already maps.
 
 ## Security
 
-- Never sends credentials or secrets in event payloads
+- Never sends credentials or secrets in event payloads — the ingest token travels in the
+  `Authorization` header only, and never reaches a log line (see "Ingest tokens")
 - Respects Hermes vault privacy (vault tools are dropped entirely)
 - Commands are reduced to program + allow-listed subcommand; files to basenames;
   search queries and URLs are not sent at all (see "What leaves the machine")
-- Dashboard URL should be internal network or VPN-only until auth is implemented
+- The dashboard URL should stay internal network or VPN-only until the public face
+  (Phase 13) is deployed; the ingest token protects `POST /events` once
+  `SOU_INGEST_TOKENS` is set, so configure it before the dashboard leaves the LAN
 
 ## Development
 
 ```bash
 # Run tests (stdlib unittest — no pytest needed)
 python3 -m unittest discover -s tests -v
+
+# End-to-end against a real token-protected dashboard (spawns a scratch backend)
+python3 tools/live_ingest_check.py --fork ~/Projects/star-office-ui-fork
 
 # Lint
 black __init__.py
